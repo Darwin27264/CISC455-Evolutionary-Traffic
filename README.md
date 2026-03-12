@@ -4,11 +4,8 @@ A custom Evolutionary Algorithm (EA) built to optimize traffic light timings acr
 
 ## 🎥 Simulation Demo
 
-*(Ensure `demo.mp4` is in the root directory of your repository for this to render correctly on GitHub)*
+https://github.com/user-attachments/assets/7adf896c-5f94-4cb4-a59f-3cc350ee0769
 
-<video src="demo.mp4" controls="controls" style="max-width: 100%; height: auto;">
-  Your browser does not support the video tag.
-</video>
 
 ## 📋 Project Overview
 
