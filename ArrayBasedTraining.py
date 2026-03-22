@@ -27,11 +27,17 @@ Traffic-light encoding (same as original):
     4: both red
 """
 
+import bisect
 import numpy as np
 import random
 import pickle
 import copy
+import os
 import sys
+from datetime import datetime
+from typing import List, Optional, Tuple
+
+from routing import DriveLeg, RoadPosition, try_plan_goal_route
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -41,6 +47,16 @@ HEADLESS_MODE     = True  # No pygame dependency for this script
 SPAWN_RATE        = 0.25  # Probability per attempt of a vehicle spawning
 SPAWNS_PER_SECOND = 4     # How many spawn attempts per simulation second
 SPEED_LIMIT       = 10    # metres per second
+
+# Optional back-pressure: stop injecting vehicles when the grid is already saturated.
+# None = never throttle (maximum stress for the EA; queues can grow without bound).
+# Set to e.g. 280 for demos / sanity checks so active count reaches a steadier plateau.
+MAX_ACTIVE_VEHICLES_FOR_SPAWN: Optional[int] = None
+
+# Goal-directed vehicles: fraction of spawn attempts routed to interior spawn + A* route.
+# Each attempt samples uniformly in [MIN, MAX] for extra training variability (set equal for fixed rate).
+GOAL_VEHICLE_FRACTION_MIN = 0.40
+GOAL_VEHICLE_FRACTION_MAX = 0.60
 
 # EA parameters
 POP_SIZE      = 25
@@ -69,6 +85,10 @@ INTERSECTIONS = INTERSECTIONS_H  # legacy alias — do not use for stop-line log
 #            v-road vehicles travel along y, crossing horizontal roads at INTERSECTIONS_H
 MAP_END = 1000
 
+# Forward scan for car-following (metres). Must exceed ~1 s free-run at vmax (10 m/s)
+# or leaders stay “invisible” until dangerously close; 120 m is a safe default.
+CAR_FOLLOW_LOOKAHEAD_M = min(MAP_END, 120)
+
 def _build_segs(intersections):
     """Return (lengths, starts) for a given intersection list."""
     boundaries = [0] + intersections + [MAP_END]
@@ -82,6 +102,12 @@ SEGMENT_LENGTHS_V, SEGMENT_STARTS_V = _build_segs(INTERSECTIONS_V)
 # Legacy aliases (used by build_road_arrays which iterates both axes)
 SEGMENT_LENGTHS = SEGMENT_LENGTHS_H
 SEGMENT_STARTS  = SEGMENT_STARTS_H
+
+# Precomputed segment boundaries for O(log n) pos_to_seg via bisect.
+# H-axis vehicles travel along x and are divided by INTERSECTIONS_V crossings.
+# V-axis vehicles travel along y and are divided by INTERSECTIONS_H crossings.
+_BOUNDARIES_FOR_H = [0] + list(INTERSECTIONS_V) + [MAP_END]
+_BOUNDARIES_FOR_V = [0] + list(INTERSECTIONS_H) + [MAP_END]
 
 # ---------------------------------------------------------------------------
 # Road array factory
@@ -102,7 +128,6 @@ def build_road_arrays():
                 for direction in (1, -1):
                     arrays[(axis, channel_idx, seg_idx, direction)] = np.zeros(seg_len, dtype=int)
     return arrays
-    return arrays
 
 # ---------------------------------------------------------------------------
 # Helper: convert absolute position → (seg_idx, local_index)
@@ -115,20 +140,79 @@ def pos_to_seg(abs_pos, axis='h'):
     axis='h' → segments divided by INTERSECTIONS_V (x-crossings for h-roads)
     axis='v' → segments divided by INTERSECTIONS_H (y-crossings for v-roads)
     """
-    intersections = INTERSECTIONS_V if axis == 'h' else INTERSECTIONS_H
-    seg_lengths   = SEGMENT_LENGTHS_V if axis == 'h' else SEGMENT_LENGTHS_H
-    boundaries = [0] + intersections + [MAP_END]
-    for i in range(len(boundaries) - 1):
-        lo, hi = boundaries[i], boundaries[i + 1]
-        if lo <= abs_pos < hi:
-            return i, int(abs_pos - lo)
-    last = len(seg_lengths) - 1
-    return last, seg_lengths[last] - 1
+    boundaries  = _BOUNDARIES_FOR_H if axis == 'h' else _BOUNDARIES_FOR_V
+    seg_lengths = SEGMENT_LENGTHS_V if axis == 'h' else SEGMENT_LENGTHS_H
+    i = bisect.bisect_right(boundaries, abs_pos) - 1
+    i = max(0, min(i, len(seg_lengths) - 1))
+    local = int(abs_pos - boundaries[i])
+    return i, max(0, min(local, seg_lengths[i] - 1))
 
 def seg_to_pos(seg_idx, local_idx, axis='h'):
     """Inverse of pos_to_seg."""
     starts = SEGMENT_STARTS_V if axis == 'h' else SEGMENT_STARTS_H
     return starts[seg_idx] + local_idx
+
+# ---------------------------------------------------------------------------
+# Car-following (shared by Vehicle and GoalVehicle)
+# ---------------------------------------------------------------------------
+
+SAFETY_BUFFER_M = 2.0  # metres; keep below dist_to_front to avoid overlap
+
+
+def _speed_from_headway(
+    dist_to_front: float,
+    speed: float,
+    max_speed: float,
+    accel: float,
+    safety_buffer: float = SAFETY_BUFFER_M,
+) -> Tuple[float, bool]:
+    """
+    One-second update: speed capped by how much space exists beyond the buffer.
+
+    The old rule ``speed = max(0, dist - buffer)`` whenever ``dist <= speed + buffer``
+    froze vehicles whenever ``0 < dist <= buffer`` (e.g. 1 m short of a stop line
+    or leg end), so platoons never woke up after the light turned green.
+
+    Returns (new_speed, True) if we must hold (no room past buffer), else (new_speed, False).
+    """
+    cap = dist_to_front - safety_buffer
+    if cap <= 0:
+        return 0.0, True
+    new_speed = min(float(max_speed), speed + float(accel), cap)
+    return new_speed, False
+
+
+def _speed_goal_vehicle(
+    dist_traffic: float,
+    d_leg: float,
+    speed: float,
+    max_speed: float,
+    accel: float,
+    safety_buffer: float = SAFETY_BUFFER_M,
+) -> Tuple[float, bool]:
+    """
+    Goal vehicles: lights and car-following use the bumper buffer; the leg endpoint
+    (intersection / turn) does not — subtracting the buffer from d_leg made
+    cap = d_leg - 2 <= 0 whenever the car was within 2 m of its turn, so they
+    never moved again even with a green light.
+    """
+    if dist_traffic == float("inf"):
+        cap_traffic = float("inf")
+    else:
+        cap_traffic = dist_traffic - safety_buffer
+
+    cap_leg = max(0.0, d_leg)
+
+    if cap_traffic == float("inf"):
+        cap = cap_leg
+    else:
+        cap = min(max(0.0, cap_traffic), cap_leg)
+
+    if cap <= 0:
+        return 0.0, True
+    new_speed = min(float(max_speed), speed + float(accel), cap)
+    return new_speed, False
+
 
 # ---------------------------------------------------------------------------
 # Vehicle
@@ -139,6 +223,8 @@ VTYPES = {
     'car':   {'length': 1, 'accel': 2, 'max_speed': SPEED_LIMIT},
     'bus':   {'length': 3, 'accel': 1, 'max_speed': SPEED_LIMIT},
     'truck': {'length': 5, 'accel': 1, 'max_speed': SPEED_LIMIT},
+    # Same dynamics as car; uses A* legs + turns (see GoalVehicle)
+    'goal_car': {'length': 1, 'accel': 2, 'max_speed': SPEED_LIMIT},
 }
 
 class Vehicle:
@@ -159,7 +245,14 @@ class Vehicle:
 
     _next_id = 1  # class-level counter; reset externally each simulation run
 
-    def __init__(self, vtype: str, axis: str, direction: int, channel_idx: int):
+    def __init__(
+        self,
+        vtype: str,
+        axis: str,
+        direction: int,
+        channel_idx: int,
+        abs_pos_override: Optional[float] = None,
+    ):
         self.id        = Vehicle._next_id
         Vehicle._next_id += 1
 
@@ -173,8 +266,11 @@ class Vehicle:
         self.direction   = direction   # 1 or -1
         self.channel_idx = channel_idx # index into INTERSECTIONS
 
-        # Spawn at the boundary and at top speed
-        self.abs_pos = 0.0 if direction == 1 else float(MAP_END)
+        # Spawn at the boundary and at top speed, unless overridden (interior spawn)
+        if abs_pos_override is not None:
+            self.abs_pos = float(abs_pos_override)
+        else:
+            self.abs_pos = 0.0 if direction == 1 else float(MAP_END)
         self.speed   = float(self.max_speed)
 
         self.travel_time = 0
@@ -185,31 +281,35 @@ class Vehicle:
     # Array footprint helpers
     # ------------------------------------------------------------------
 
-    def _write_to_arrays(self, road_arrays, value):
-        """
-        Write `value` into every cell occupied by this vehicle.
-        The front of the vehicle is at abs_pos; each subsequent body cell
-        trails one metre behind (opposite to direction of travel), so a
-        vehicle of length L fills cells at:
-            abs_pos, abs_pos - direction, abs_pos - 2*direction, …
-        """
+    def _cells(self) -> list:
+        """Return list of (axis, channel_idx, direction, seg_idx, local_idx) for every body cell."""
+        cells = []
         pos = self.abs_pos
         for _ in range(self.length):
             si, li = pos_to_seg(pos, self.axis)
-            key = (self.axis, self.channel_idx, si, self.direction)
-            if key in road_arrays:
-                arr = road_arrays[key]
-                li_clamped = max(0, min(li, len(arr) - 1))
-                arr[li_clamped] = value
-            pos -= self.direction  # next body cell is one metre behind the front
+            li_c = max(0, li)
+            cells.append((self.axis, self.channel_idx, self.direction, si, li_c))
+            pos -= self.direction
+        return cells
 
     def stamp(self, road_arrays):
         """Stamp vehicle id into road arrays."""
-        self._write_to_arrays(road_arrays, self.id)
+        for ax, ch, d, si, li in self._cells():
+            key = (ax, ch, si, d)
+            if key in road_arrays:
+                arr = road_arrays[key]
+                idx = min(li, len(arr) - 1)
+                arr[idx] = self.id
 
     def erase(self, road_arrays):
-        """Clear vehicle footprint from road arrays."""
-        self._write_to_arrays(road_arrays, 0)
+        """Clear only cells that still contain this vehicle's id (safe against overwrites)."""
+        for ax, ch, d, si, li in self._cells():
+            key = (ax, ch, si, d)
+            if key in road_arrays:
+                arr = road_arrays[key]
+                idx = min(li, len(arr) - 1)
+                if arr[idx] == self.id:
+                    arr[idx] = 0
 
     # ------------------------------------------------------------------
     # Movement
@@ -220,14 +320,12 @@ class Vehicle:
         if self.finished:
             return
 
-        # --- Acceleration / braking ---
-        safety_buffer = 2
-        if dist_to_front <= self.speed + safety_buffer:
-            self.speed = max(0.0, dist_to_front - safety_buffer)
-            if self.speed == 0:
-                self.idling_time += 1
-        else:
-            self.speed = min(float(self.max_speed), self.speed + self.accel)
+        # dist_to_front = min(gap to vehicle ahead, distance to stop line if red)
+        self.speed, hold = _speed_from_headway(
+            dist_to_front, self.speed, self.max_speed, self.accel
+        )
+        if hold:
+            self.idling_time += 1
 
         if self.speed == 0:
             self.travel_time += 1
@@ -250,6 +348,253 @@ class Vehicle:
         # --- Stamp new position ---
         self.stamp(road_arrays)
         self.travel_time += 1
+
+
+class GoalVehicle(Vehicle):
+    """
+    Interior-spawned vehicle following precomputed A* legs; finishes at route goal
+    (not at map boundaries). path_xy is in simulation (x, y) metres for drawing.
+
+    Each step, the caller passes min(gap ahead, stop-line distance); this class
+    further limits by distance to the current leg end, so lights and car-following
+    apply the same way as for regular vehicles.
+    """
+
+    def __init__(
+        self,
+        legs: List[DriveLeg],
+        path_xy: List[Tuple[float, float]],
+    ):
+        if not legs:
+            raise ValueError("GoalVehicle requires a non-empty leg list")
+        first = legs[0]
+        direction = 1 if first.end_abs > first.start_abs else (-1 if first.end_abs < first.start_abs else 1)
+        super().__init__(
+            "goal_car",
+            first.axis,
+            direction,
+            first.channel_idx,
+            abs_pos_override=first.start_abs,
+        )
+        self._legs = legs
+        self._leg_i = 0
+        self.path_xy = path_xy
+        self.goal_xy = (float(path_xy[-1][0]), float(path_xy[-1][1])) if path_xy else (0.0, 0.0)
+
+    def _dist_to_leg_end(self) -> float:
+        leg = self._legs[self._leg_i]
+        target = leg.end_abs
+        if self.direction == 1:
+            return max(0.0, target - self.abs_pos)
+        return max(0.0, self.abs_pos - target)
+
+    def _advance_leg(self, road_arrays) -> None:
+        """Snap to leg end, skip zero-length legs, and move to next leg or finish."""
+        leg = self._legs[self._leg_i]
+        self.erase(road_arrays)
+        self.abs_pos = leg.end_abs
+        self.speed = 0.0
+
+        if leg.is_final:
+            self.finished = True
+            return
+
+        # Skip any zero-length legs (start == end) that can arise from coincident positions.
+        while True:
+            self._leg_i += 1
+            if self._leg_i >= len(self._legs):
+                self.finished = True
+                return
+            nxt = self._legs[self._leg_i]
+            if abs(nxt.end_abs - nxt.start_abs) > 0.5:
+                break
+            if nxt.is_final:
+                self.finished = True
+                return
+
+        self.axis = nxt.axis
+        self.channel_idx = nxt.channel_idx
+        self.abs_pos = nxt.start_abs
+        if nxt.end_abs > nxt.start_abs:
+            self.direction = 1
+        elif nxt.end_abs < nxt.start_abs:
+            self.direction = -1
+
+        # Check that the new position is clear before stamping (prevents array corruption).
+        si, li = pos_to_seg(self.abs_pos, self.axis)
+        key = (self.axis, self.channel_idx, si, self.direction)
+        arr = road_arrays.get(key)
+        if arr is not None:
+            li_c = max(0, min(int(li), len(arr) - 1))
+            if arr[li_c] != 0:
+                # Space is occupied — finish early rather than corrupt the array.
+                self.finished = True
+                return
+
+        self.speed = float(self.max_speed)
+        self.stamp(road_arrays)
+
+    def step(self, road_arrays, dist_to_front: float):
+        if self.finished:
+            return
+
+        d_leg = self._dist_to_leg_end()
+        # dist_to_front = min(gap to vehicle ahead, stop-line distance); do not merge
+        # d_leg into that before applying the bumper buffer (see _speed_goal_vehicle).
+        self.speed, hold = _speed_goal_vehicle(
+            dist_to_front, d_leg, self.speed, self.max_speed, self.accel
+        )
+        if hold:
+            self.idling_time += 1
+
+        if self.speed == 0:
+            self.travel_time += 1
+            return
+
+        self.erase(road_arrays)
+        self.abs_pos += self.speed * self.direction
+
+        leg = self._legs[self._leg_i]
+        target = leg.end_abs
+        if self.direction == 1 and self.abs_pos >= target:
+            self.abs_pos = target
+            self.stamp(road_arrays)
+            self.travel_time += 1
+            self._advance_leg(road_arrays)
+            return
+        if self.direction == -1 and self.abs_pos <= target:
+            self.abs_pos = target
+            self.stamp(road_arrays)
+            self.travel_time += 1
+            self._advance_leg(road_arrays)
+            return
+
+        self.abs_pos = max(0.0, min(float(MAP_END), self.abs_pos))
+        self.stamp(road_arrays)
+        self.travel_time += 1
+
+
+def _interior_spawn_clear(
+    road_arrays: dict,
+    axis: str,
+    channel_idx: int,
+    direction: int,
+    front_abs: float,
+    v_len: int,
+) -> bool:
+    """True if body cells and forward lookahead corridor are empty."""
+    pos = front_abs
+    for _ in range(v_len):
+        if pos < 0 or pos > MAP_END:
+            return False
+        si, li = pos_to_seg(pos, axis)
+        key = (axis, channel_idx, si, direction)
+        arr = road_arrays.get(key)
+        if arr is None:
+            return False
+        li_c = max(0, min(li, len(arr) - 1))
+        if arr[li_c] != 0:
+            return False
+        pos -= direction
+
+    look = v_len + SPEED_LIMIT + 2
+    pos = front_abs
+    for _ in range(look):
+        if (direction == 1 and pos >= MAP_END) or (direction == -1 and pos <= 0):
+            break
+        si, li = pos_to_seg(pos, axis)
+        key = (axis, channel_idx, si, direction)
+        arr = road_arrays.get(key)
+        if arr is None:
+            return False
+        li_c = max(0, min(li, len(arr) - 1))
+        if arr[li_c] != 0:
+            return False
+        pos += direction
+    return True
+
+
+def try_spawn_one_vehicle(
+    road_arrays: dict,
+    vehicles: list,
+    active_vehicles: list,
+) -> None:
+    """
+    One spawn attempt under SPAWN_RATE (caller decides whether this runs).
+
+    If MAX_ACTIVE_VEHICLES_FOR_SPAWN is set and the active list is already at
+    that size, the attempt is a no-op (back-pressure).
+
+    With probability uniform in [GOAL_VEHICLE_FRACTION_MIN, GOAL_VEHICLE_FRACTION_MAX],
+    this attempt is reserved for a goal-directed vehicle: we retry planning/clearance
+    several times; if all fail, the attempt is skipped (no fallback) so the share of
+    goal cars stays near that probability when routes and space are available.
+
+    Otherwise we use the legacy boundary spawner (car / bus / truck).
+    """
+    if MAX_ACTIVE_VEHICLES_FOR_SPAWN is not None and len(
+        active_vehicles
+    ) >= MAX_ACTIVE_VEHICLES_FOR_SPAWN:
+        return
+
+    p_goal = random.uniform(GOAL_VEHICLE_FRACTION_MIN, GOAL_VEHICLE_FRACTION_MAX)
+    if random.random() < p_goal:
+        ih = np.array(INTERSECTIONS_H, dtype=float)
+        iv = np.array(INTERSECTIONS_V, dtype=float)
+        for _ in range(8):
+            planned = try_plan_goal_route(
+                random,
+                GRID_SIZE,
+                ih,
+                iv,
+                float(MAP_END),
+                max_sample_tries=25,
+            )
+            if planned is None:
+                continue
+            spawn, _goal, legs, path_xy = planned
+            first = legs[0]
+            direction = 1 if first.end_abs > first.start_abs else (-1 if first.end_abs < first.start_abs else 1)
+            v_len = VTYPES["goal_car"]["length"]
+            if _interior_spawn_clear(
+                road_arrays,
+                spawn.axis,
+                spawn.channel_idx,
+                direction,
+                spawn.abs_pos,
+                v_len,
+            ):
+                nv = GoalVehicle(legs, path_xy)
+                nv.stamp(road_arrays)
+                vehicles.append(nv)
+                active_vehicles.append(nv)
+                return
+        return
+
+    axis = random.choice(["h", "v"])
+    direction = random.choice([1, -1])
+    ch_idx = random.randint(0, GRID_SIZE - 1)
+    vtype = random.choice(["car", "bus", "truck"])
+    v_len = VTYPES[vtype]["length"]
+
+    spawn_abs = 0.0 if direction == 1 else float(MAP_END)
+    si, li = pos_to_seg(spawn_abs, axis)
+    key = (axis, ch_idx, si, direction)
+    arr = road_arrays.get(key)
+    can_spawn = False
+    if arr is not None:
+        if direction == 1:
+            check_cells = arr[: v_len + SPEED_LIMIT + 2]
+        else:
+            check_cells = arr[-(v_len + SPEED_LIMIT + 2) :]
+        can_spawn = not np.any(check_cells != 0)
+
+    if can_spawn:
+        nv = Vehicle(vtype, axis, direction, ch_idx)
+        nv.stamp(road_arrays)
+        vehicles.append(nv)
+        active_vehicles.append(nv)
+
 
 # ---------------------------------------------------------------------------
 # TimingBlock (same genotype as original)
@@ -281,32 +626,102 @@ def _clear_arrays(road_arrays):
         arr[:] = 0
 
 
+def _sort_vehicles_for_step(vehicles: list) -> None:
+    """
+    In-place sort so leaders are stepped before followers on each lane.
+
+    The sim updates vehicles sequentially while mutating shared road arrays; if a
+    follower runs before the car ahead moves, gap detection is pessimistic and
+    platoons can freeze even when the light is green. Process front-to-back per
+    (axis, channel, direction).
+    """
+    vehicles.sort(
+        key=lambda v: (
+            v.axis,
+            v.channel_idx,
+            v.direction,
+            (-v.abs_pos if v.direction == 1 else v.abs_pos),
+            v.id,
+        )
+    )
+
+
 def _dist_ahead_in_arrays(vehicle: Vehicle, road_arrays: dict) -> float:
     """
     Scan forward in the road arrays from the vehicle's front and return the
     gap (in metres) to the nearest occupied cell.
 
+    Uses numpy slicing per segment instead of a per-cell Python loop,
+    which is significantly faster for the common case where the gap is
+    within the current segment (~150–300 m) or the road is clear.
+
     Returns float('inf') if the road ahead is clear.
     """
-    look_ahead = int(vehicle.max_speed) + vehicle.length + 4  # metres to scan
-    gap = float('inf')
+    look = max(
+        CAR_FOLLOW_LOOKAHEAD_M,
+        int(vehicle.max_speed) + vehicle.length + 12,
+    )
+    vid = vehicle.id
+    axis = vehicle.axis
+    ch = vehicle.channel_idx
+    d = vehicle.direction
+    seg_lengths = SEGMENT_LENGTHS_V if axis == 'h' else SEGMENT_LENGTHS_H
+    n_segs = len(seg_lengths)
 
-    pos = vehicle.abs_pos + vehicle.direction  # start one metre ahead
-    for step in range(look_ahead):
-        if (vehicle.direction == 1 and pos >= MAP_END) or \
-           (vehicle.direction == -1 and pos <= 0):
-            break
-        si, li = pos_to_seg(pos, vehicle.axis)
-        key = (vehicle.axis, vehicle.channel_idx, si, vehicle.direction)
-        if key in road_arrays:
-            arr = road_arrays[key]
-            li_c = max(0, min(li, len(arr) - 1))
-            if arr[li_c] != 0 and arr[li_c] != vehicle.id:
-                gap = step + 1  # distance is the step count (1-based)
+    si, li = pos_to_seg(vehicle.abs_pos, axis)
+    scanned = 0
+
+    if d == 1:
+        cursor = li + 1
+        seg = si
+        while scanned < look and 0 <= seg < n_segs:
+            arr = road_arrays.get((axis, ch, seg, d))
+            if arr is None:
                 break
-        pos += vehicle.direction
+            slen = len(arr)
+            if cursor >= slen:
+                seg += 1
+                cursor = 0
+                continue
+            end = min(slen, cursor + look - scanned)
+            sl = arr[cursor:end]
+            mask = (sl != 0) & (sl != vid)
+            nz = np.flatnonzero(mask)
+            if nz.size:
+                return float(scanned + int(nz[0]) + 1)
+            scanned += end - cursor
+            seg += 1
+            cursor = 0
+    else:
+        cursor = li - 1
+        seg = si
+        while scanned < look and 0 <= seg < n_segs:
+            arr = road_arrays.get((axis, ch, seg, d))
+            if arr is None:
+                break
+            if cursor < 0:
+                seg -= 1
+                if 0 <= seg < n_segs:
+                    cursor = seg_lengths[seg] - 1
+                continue
+            start = max(0, cursor - (look - scanned) + 1)
+            sl = arr[start:cursor + 1]
+            if sl.size == 0:
+                seg -= 1
+                if 0 <= seg < n_segs:
+                    cursor = seg_lengths[seg] - 1
+                continue
+            sl_rev = sl[::-1]
+            mask = (sl_rev != 0) & (sl_rev != vid)
+            nz = np.flatnonzero(mask)
+            if nz.size:
+                return float(scanned + int(nz[0]) + 1)
+            scanned += cursor - start + 1
+            seg -= 1
+            if 0 <= seg < n_segs:
+                cursor = seg_lengths[seg] - 1
 
-    return gap
+    return float('inf')
 
 
 def _dist_to_stop_line(vehicle: Vehicle, light: int) -> float:
@@ -336,8 +751,11 @@ def _dist_to_stop_line(vehicle: Vehicle, light: int) -> float:
     if not valid_stops:
         return float('inf')
 
-    closest = min(valid_stops, key=lambda x: abs(x - vehicle.abs_pos))
-    return abs(closest - vehicle.abs_pos)
+    if vehicle.direction == 1:
+        nxt = min(valid_stops)
+        return max(0.0, float(nxt - vehicle.abs_pos))
+    nxt = max(valid_stops)
+    return max(0.0, float(vehicle.abs_pos - nxt))
 
 
 def evaluate(genes, seed, gen_idx=0, verbose=False):
@@ -346,6 +764,19 @@ def evaluate(genes, seed, gen_idx=0, verbose=False):
 
     Returns the normalised fitness score (lower = better).
     Set verbose=True to print a live snapshot every 10 simulation-minutes.
+
+    Evaluation validity (demand vs capacity)
+    ----------------------------------------
+    Expected spawn attempts per hour: 3600 * SPAWNS_PER_SECOND * SPAWN_RATE
+    (each attempt may still fail: goal-slot retries, boundary full, optional
+    MAX_ACTIVE_VEHICLES_FOR_SPAWN). If sustained injection exceeds what the
+    network can discharge through exits + goal completions, active vehicles and
+    idling *should* rise over time — that is a feature of the stress test, not
+    necessarily a physics bug. Use MAX_ACTIVE_VEHICLES_FOR_SPAWN to meter input
+    when you need a bounded queue for visualization or ablation studies.
+
+    All individuals in a generation use the same ``seed`` so fitness comparisons
+    are paired on identical traffic randomness (fair selection pressure).
     """
     random.seed(seed)
     Vehicle._next_id = 1
@@ -367,36 +798,12 @@ def evaluate(genes, seed, gen_idx=0, verbose=False):
         # --- Spawning: attempt SPAWNS_PER_SECOND times per tick ---
         for _ in range(SPAWNS_PER_SECOND):
             if random.random() < SPAWN_RATE:
-                axis      = random.choice(['h', 'v'])
-                direction = random.choice([1, -1])
-                ch_idx    = random.randint(0, GRID_SIZE - 1)
-                vtype     = random.choice(['car', 'bus', 'truck'])
-                v_len     = VTYPES[vtype]['length']
-
-                # The spawn point is the boundary cell (0 for dir=1, MAP_END-1 for dir=-1)
-                spawn_abs = 0.0 if direction == 1 else float(MAP_END)
-                si, li = pos_to_seg(spawn_abs, axis)
-                key = (axis, ch_idx, si, direction)
-
-                # Check that enough space exists in the array for the vehicle body
-                arr = road_arrays.get(key)
-                can_spawn = False
-                if arr is not None:
-                    if direction == 1:
-                        check_cells = arr[:v_len + SPEED_LIMIT + 2]
-                    else:
-                        check_cells = arr[-(v_len + SPEED_LIMIT + 2):]
-                    can_spawn = not np.any(check_cells != 0)
-
-                if can_spawn:
-                    nv = Vehicle(vtype, axis, direction, ch_idx)
-                    nv.stamp(road_arrays)
-                    vehicles.append(nv)
-                    active_vehicles.append(nv)
+                try_spawn_one_vehicle(road_arrays, vehicles, active_vehicles)
 
         light = int(schedule[t])
 
         # --- Physics step ---
+        _sort_vehicles_for_step(active_vehicles)
         next_active = []
         for v in active_vehicles:
             dist_arr   = _dist_ahead_in_arrays(v, road_arrays)
@@ -427,14 +834,22 @@ def evaluate(genes, seed, gen_idx=0, verbose=False):
     score = sum(v.travel_time + v.idling_time * 2 for v in vehicles)
     normalised = score / max(len(vehicles), 1)
 
+    total_idle = sum(v.idling_time for v in vehicles)
+    avg_tt     = sum(v.travel_time for v in finished) / max(len(finished), 1)
+
     if verbose:
-        total_idle = sum(v.idling_time for v in vehicles)
-        avg_tt     = sum(v.travel_time for v in finished) / max(len(finished), 1)
         print(f"  --- Sim done | total spawned={len(vehicles)} | finished={len(finished)} "
               f"| unfinished={len(unfinished)} | total idling-secs={total_idle} "
               f"| avg travel time (finished)={avg_tt:.1f}s | score={normalised:.2f} ---")
 
-    return normalised
+    stats = {
+        'spawned': len(vehicles),
+        'finished': len(finished),
+        'unfinished': len(unfinished),
+        'total_idle': total_idle,
+        'avg_tt': avg_tt,
+    }
+    return normalised, stats
 
 # ---------------------------------------------------------------------------
 # Evolutionary operators
@@ -452,19 +867,92 @@ def crossover(p1, p2):
         return p1[:split] + p2[split:]
     return copy.deepcopy(p1)
 
+
+def project_dir() -> str:
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def runs_root() -> str:
+    return os.path.join(project_dir(), "runs")
+
+
+def create_timestamped_run_dir() -> str:
+    """Create runs/YYYY-MM-DD_HHMMSS/ for this training run (see register_completed_run)."""
+    root = runs_root()
+    os.makedirs(root, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    out = os.path.join(root, stamp)
+    os.makedirs(out, exist_ok=True)
+    return out
+
+
+def register_completed_run(run_dir: str) -> None:
+    """Point runs/latest_run.txt at this folder so validation/replay load the newest pickle."""
+    stamp = os.path.basename(os.path.normpath(run_dir))
+    latest = os.path.join(runs_root(), "latest_run.txt")
+    os.makedirs(runs_root(), exist_ok=True)
+    with open(latest, "w", encoding="utf-8") as f:
+        f.write(stamp + "\n")
+
+
+def read_latest_run_stamp() -> Optional[str]:
+    p = os.path.join(runs_root(), "latest_run.txt")
+    if not os.path.isfile(p):
+        return None
+    with open(p, encoding="utf-8") as f:
+        s = f.read().strip()
+    return s or None
+
+
+def resolve_pkl_path(pkl_arg: Optional[str] = None) -> str:
+    """Pickle path: explicit --pkl, else runs/<latest>/best_timing_array.pkl, else legacy cwd file."""
+    if pkl_arg:
+        return os.path.abspath(pkl_arg)
+    stamp = read_latest_run_stamp()
+    if stamp:
+        cand = os.path.join(runs_root(), stamp, "best_timing_array.pkl")
+        if os.path.isfile(cand):
+            return cand
+    return os.path.join(project_dir(), "best_timing_array.pkl")
+
+
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    # Initial population: each individual is a list of 40 TimingBlocks
+    import argparse
+    import time as _time
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    parser = argparse.ArgumentParser(description="EA traffic-light training")
+    parser.add_argument('-j', '--workers', type=int, default=0,
+                        help='Parallel evaluation workers (0 = auto-detect CPU count)')
+    parser.add_argument('--gens', type=int, default=GENS,
+                        help=f'Number of generations (default {GENS})')
+    parser.add_argument('--pop-size', type=int, default=POP_SIZE,
+                        help=f'Population size (default {POP_SIZE})')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Re-run best individual with verbose mid-sim snapshots each gen')
+    cli = parser.parse_args()
+
+    n_workers = cli.workers or os.cpu_count() or 4
+    n_gens    = cli.gens
+    n_pop     = cli.pop_size
+
+    run_dir = create_timestamped_run_dir()
+    pkl_out = os.path.join(run_dir, "best_timing_array.pkl")
+    print(f"Run output directory: {run_dir}")
+
     pop = [
         [TimingBlock(random.randint(15, 50), random.randint(15, 50)) for _ in range(40)]
-        for _ in range(POP_SIZE)
+        for _ in range(n_pop)
     ]
     baseline_genes = [TimingBlock(30, 30) for _ in range(60)]
 
-    print(f"Starting EA | POP_SIZE={POP_SIZE} | GENS={GENS} | MUTATION_RATE={MUTATION_RATE} | CROSSOVER_RATE={CROSSOVER_RATE}")
+    print(f"Starting EA | POP_SIZE={n_pop} | GENS={n_gens} "
+          f"| MUTATION_RATE={MUTATION_RATE} | CROSSOVER_RATE={CROSSOVER_RATE}")
+    print(f"Workers: {n_workers}  (parallel evaluation)")
     print(f"Grid: {GRID_SIZE}x{GRID_SIZE}")
     print(f"  H roads (y-coords): {[f'{x:.0f}' for x in INTERSECTIONS_H]}")
     print(f"  V roads (x-coords): {[f'{x:.0f}' for x in INTERSECTIONS_V]}")
@@ -472,53 +960,73 @@ if __name__ == '__main__':
     print(f"  V seg lengths: {SEGMENT_LENGTHS_V}")
     print("-" * 80)
 
-    for gen in range(GENS):
-        seed = 3000 + gen
-        print(f"\n[Gen {gen:02d}/{GENS-1}] Seed={seed}")
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        for gen in range(n_gens):
+            seed = 3000 + gen
+            gen_t0 = _time.perf_counter()
+            print(f"\n[Gen {gen:02d}/{n_gens-1}] Seed={seed}")
 
-        sys.stdout.write(f"  Evaluating baseline...")
-        sys.stdout.flush()
-        base_score = evaluate(baseline_genes, seed)
-        print(f"\r  Baseline score: {base_score:.2f}")
+            # Submit baseline + all individuals concurrently
+            baseline_future = pool.submit(evaluate, baseline_genes, seed)
+            future_to_idx = {}
+            for i, ind in enumerate(pop):
+                future_to_idx[pool.submit(evaluate, ind, seed, gen)] = i
 
-        scores = []
-        for i, ind in enumerate(pop):
-            sys.stdout.write(f"\r  Evaluating individual {i+1:3d}/{POP_SIZE}...")
+            base_score, _ = baseline_future.result()
+
+            scores      = [0.0] * n_pop
+            stats_list  = [None] * n_pop
+            done = 0
+            for f in as_completed(future_to_idx):
+                idx = future_to_idx[f]
+                sc, st = f.result()
+                scores[idx] = sc
+                stats_list[idx] = st
+                done += 1
+                sys.stdout.write(f"\r  Evaluating: {done}/{n_pop} done")
+                sys.stdout.flush()
+            sys.stdout.write("\r" + " " * 50 + "\r")
             sys.stdout.flush()
-            scores.append(evaluate(ind, seed, gen_idx=gen))
-        sys.stdout.write("\r" + " " * 50 + "\r")
-        sys.stdout.flush()
 
-        scores_arr = np.array(scores)
-        best_idx   = int(np.argmin(scores_arr))
-        best_score = scores_arr[best_idx]
-        mean_score = scores_arr.mean()
-        worst_score= scores_arr.max()
-        diff       = base_score - best_score
+            scores_arr  = np.array(scores)
+            best_idx    = int(np.argmin(scores_arr))
+            best_score  = scores_arr[best_idx]
+            mean_score  = scores_arr.mean()
+            worst_score = scores_arr.max()
+            diff        = base_score - best_score
 
-        print(f"  Scores  → best: {best_score:.2f}  mean: {mean_score:.2f}  worst: {worst_score:.2f}")
-        print(f"  Baseline→ {base_score:.2f}  |  EA improvement over baseline: {diff:+.2f}")
+            print(f"  Scores  -> best: {best_score:.2f}  mean: {mean_score:.2f}  worst: {worst_score:.2f}")
+            print(f"  Baseline-> {base_score:.2f}  |  EA improvement over baseline: {diff:+.2f}")
 
-        # Verbose breakdown of the best individual this generation
-        print(f"  Best individual (idx={best_idx}) sim breakdown:")
-        evaluate(pop[best_idx], seed, gen_idx=gen, verbose=True)
+            bs = stats_list[best_idx]
+            print(f"  Best #{best_idx}: spawned={bs['spawned']} finished={bs['finished']} "
+                  f"unfinished={bs['unfinished']} idle={bs['total_idle']}s "
+                  f"avg_tt={bs['avg_tt']:.1f}s")
 
-        # Elitism + reproduction
-        new_pop = [pop[best_idx]]
-        while len(new_pop) < POP_SIZE:
-            p1    = tournament_selection(pop, scores, k=TOURNAMENT_K)
-            p2    = tournament_selection(pop, scores, k=TOURNAMENT_K)
-            child = crossover(p1, p2)
-            if random.random() < MUTATION_RATE:
-                child[random.randint(0, len(child) - 1)] = TimingBlock(
-                    random.randint(10, 80), random.randint(10, 80)
-                )
-            new_pop.append(child)
+            if cli.verbose:
+                print(f"  Verbose re-evaluation of best individual:")
+                evaluate(pop[best_idx], seed, gen_idx=gen, verbose=True)
 
-        pop = new_pop
-        print("-" * 80)
+            gen_elapsed = _time.perf_counter() - gen_t0
+            print(f"  Generation wall time: {gen_elapsed:.1f}s")
 
-    with open('best_timing_array.pkl', 'wb') as f:
+            # Elitism + reproduction
+            new_pop = [pop[best_idx]]
+            while len(new_pop) < n_pop:
+                p1    = tournament_selection(pop, scores, k=TOURNAMENT_K)
+                p2    = tournament_selection(pop, scores, k=TOURNAMENT_K)
+                child = crossover(p1, p2)
+                if random.random() < MUTATION_RATE:
+                    child[random.randint(0, len(child) - 1)] = TimingBlock(
+                        random.randint(10, 80), random.randint(10, 80)
+                    )
+                new_pop.append(child)
+
+            pop = new_pop
+            print("-" * 80)
+
+    with open(pkl_out, 'wb') as f:
         pickle.dump(pop[0], f)
+    register_completed_run(run_dir)
 
-    print("\nTraining complete. Best strategy saved to best_timing_array.pkl")
+    print(f"\nTraining complete. Best strategy saved to:\n  {pkl_out}")

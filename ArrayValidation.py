@@ -15,27 +15,53 @@ import random
 import sys
 import os
 
+
+def _pkl_from_argv():
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == '--pkl' and i + 1 < len(args):
+            return args[i + 1]
+        i += 1
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Re-import everything from the training script so classes match pickle
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(__file__))
 from ArrayBasedTraining import (
-    Vehicle, TimingBlock, VTYPES,
-    INTERSECTIONS_H, INTERSECTIONS_V, SEGMENT_LENGTHS_H, SEGMENT_LENGTHS_V,
-    MAP_END, GRID_SIZE, SPAWN_RATE, SPAWNS_PER_SECOND, SPEED_LIMIT,
-    build_road_arrays, pos_to_seg,
-    _dist_ahead_in_arrays, _dist_to_stop_line,
+    Vehicle,
+    TimingBlock,
+    VTYPES,
+    INTERSECTIONS_H,
+    INTERSECTIONS_V,
+    SEGMENT_LENGTHS_H,
+    SEGMENT_LENGTHS_V,
+    MAP_END,
+    GRID_SIZE,
+    SPAWN_RATE,
+    SPAWNS_PER_SECOND,
+    SPEED_LIMIT,
+    build_road_arrays,
+    _dist_ahead_in_arrays,
+    _dist_to_stop_line,
+    _sort_vehicles_for_step,
+    try_spawn_one_vehicle,
+    resolve_pkl_path,
 )
 
 # ---------------------------------------------------------------------------
 # Load model
 # ---------------------------------------------------------------------------
-PKL_PATH = os.path.join(os.path.dirname(__file__), 'best_timing_array.pkl')
+PKL_PATH = os.path.abspath(resolve_pkl_path(_pkl_from_argv()))
+OUTPUT_DIR = os.path.dirname(PKL_PATH)
 
 with open(PKL_PATH, 'rb') as f:
     best_blocks = pickle.load(f)
 
 print(f"Loaded {len(best_blocks)} TimingBlocks from {PKL_PATH}")
+print(f"Saving plots to: {OUTPUT_DIR}")
 
 # ---------------------------------------------------------------------------
 # Flatten chromosome into a 3600-second schedule
@@ -74,7 +100,7 @@ ax.set_yticklabels(['0: NS Green', '1: NS Yellow', '2: EW Green',
 ax.grid(True, axis='x', alpha=0.3)
 ax.legend()
 plt.tight_layout()
-plt.savefig('plot_phase_sequence.png', dpi=150)
+plt.savefig(os.path.join(OUTPUT_DIR, 'plot_phase_sequence.png'), dpi=150)
 plt.show()
 print("Saved: plot_phase_sequence.png")
 
@@ -95,29 +121,10 @@ def replay(sched, seed=3000, label=""):
     for t in range(3600):
         for _ in range(SPAWNS_PER_SECOND):
             if random.random() < SPAWN_RATE:
-                axis      = random.choice(['h', 'v'])
-                direction = random.choice([1, -1])
-                ch_idx    = random.randint(0, GRID_SIZE - 1)
-                vtype     = random.choice(['car', 'bus', 'truck'])
-                v_len     = VTYPES[vtype]['length']
-
-                spawn_abs = 0.0 if direction == 1 else float(MAP_END)
-                si, li    = pos_to_seg(spawn_abs, axis)
-                key       = (axis, ch_idx, si, direction)
-                arr       = road_arrays.get(key)
-                can_spawn = False
-                if arr is not None:
-                    check = arr[:v_len + SPEED_LIMIT + 2] if direction == 1 \
-                            else arr[-(v_len + SPEED_LIMIT + 2):]
-                    can_spawn = not np.any(check != 0)
-
-                if can_spawn:
-                    nv = Vehicle(vtype, axis, direction, ch_idx)
-                    nv.stamp(road_arrays)
-                    vehicles.append(nv)
-                    active_vehicles.append(nv)
+                try_spawn_one_vehicle(road_arrays, vehicles, active_vehicles)
 
         light = int(flat_sched[t])
+        _sort_vehicles_for_step(active_vehicles)
         next_active = []
         for v in active_vehicles:
             dist = min(_dist_ahead_in_arrays(v, road_arrays),
@@ -141,7 +148,7 @@ def replay(sched, seed=3000, label=""):
     print(f"  Fitness score : {normalised:.2f}")
     print(f"{'='*60}")
 
-    for vt in ('car', 'bus', 'truck'):
+    for vt in ('car', 'bus', 'truck', 'goal_car'):
         vt_all  = [v for v in vehicles  if v.vtype == vt]
         vt_fin  = [v for v in finished  if v.vtype == vt]
         if not vt_all:
@@ -164,7 +171,7 @@ bl_vehicles, bl_finished, bl_density, bl_score = replay(baseline_schedule, seed=
 # ---------------------------------------------------------------------------
 # Plot 2 — Per-vehicle-type avg travel time (evolved vs baseline)
 # ---------------------------------------------------------------------------
-vtypes = ['car', 'bus', 'truck']
+vtypes = ['car', 'bus', 'truck', 'goal_car']
 x = np.arange(len(vtypes))
 width = 0.35
 
@@ -204,7 +211,7 @@ axes[1].grid(axis='y', alpha=0.3)
 
 plt.suptitle("Evolved vs Baseline: Travel & Idling Breakdown", fontsize=13)
 plt.tight_layout()
-plt.savefig('plot_vehicle_breakdown.png', dpi=150)
+plt.savefig(os.path.join(OUTPUT_DIR, 'plot_vehicle_breakdown.png'), dpi=150)
 plt.show()
 print("Saved: plot_vehicle_breakdown.png")
 
@@ -230,7 +237,7 @@ ax.set_ylim(0, 110)
 ax.legend()
 ax.grid(axis='y', alpha=0.3)
 plt.tight_layout()
-plt.savefig('plot_finish_rate.png', dpi=150)
+plt.savefig(os.path.join(OUTPUT_DIR, 'plot_finish_rate.png'), dpi=150)
 plt.show()
 print("Saved: plot_finish_rate.png")
 
@@ -254,7 +261,7 @@ ax.set_ylabel("Active vehicles on grid", fontsize=12)
 ax.legend()
 ax.grid(alpha=0.3)
 plt.tight_layout()
-plt.savefig('plot_density.png', dpi=150)
+plt.savefig(os.path.join(OUTPUT_DIR, 'plot_density.png'), dpi=150)
 plt.show()
 print("Saved: plot_density.png")
 

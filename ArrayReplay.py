@@ -3,6 +3,10 @@ ArrayReplay.py
 --------------
 Pygame visualiser for the best strategy saved in best_timing_array.pkl.
 
+Replay uses lower spawn intensity than training (see REPLAY_SPAWN_RATE_MULT) so the map
+stays readable. Goal cars get a unique color; the matching line is the remaining route
+and the diamond is the destination.
+
 Controls:
   SPACE  — pause / unpause
   +/-    — speed up / slow down
@@ -13,14 +17,38 @@ import pickle
 import random
 import sys
 import os
+import colorsys
 import pygame
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+
+def _pkl_from_argv():
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == '--pkl' and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
 from ArrayBasedTraining import (
-    Vehicle, TimingBlock, VTYPES,
-    INTERSECTIONS_H, INTERSECTIONS_V,
-    MAP_END, GRID_SIZE, SPAWN_RATE, SPAWNS_PER_SECOND, SPEED_LIMIT,
-    build_road_arrays, pos_to_seg, _dist_ahead_in_arrays, _dist_to_stop_line,
+    Vehicle,
+    GoalVehicle,
+    TimingBlock,
+    VTYPES,
+    INTERSECTIONS_H,
+    INTERSECTIONS_V,
+    MAP_END,
+    GRID_SIZE,
+    SPAWN_RATE,
+    SPAWNS_PER_SECOND,
+    SPEED_LIMIT,
+    build_road_arrays,
+    _dist_ahead_in_arrays,
+    _dist_to_stop_line,
+    _sort_vehicles_for_step,
+    try_spawn_one_vehicle,
+    resolve_pkl_path,
 )
 import numpy as np
 
@@ -31,6 +59,10 @@ WIN_W, WIN_H = 900, 950   # extra 150px at bottom for HUD
 SIM_W, SIM_H = 900, 800   # simulation area
 SCALE = SIM_W / MAP_END   # metres → pixels  (0.9 px/m for 1000m map)
 
+# Replay-only: lighter traffic so the window stays readable (training / validation unchanged).
+REPLAY_SPAWN_RATE_MULT = 0.40
+REPLAY_SPAWNS_PER_TICK = max(1, int(round(SPAWNS_PER_SECOND * 0.45)))
+
 ROAD_HALF_W  = 18          # pixels, half the road width drawn on screen
 LANE_OFFSET  = 6           # pixels, offset from road centre for each direction lane
 STOP_MARK_LEN = 6          # pixels, length of the stop-line tick
@@ -39,6 +71,7 @@ VEHICLE_COLORS = {
     'car':   (70,  130, 255),
     'bus':   (255, 160,  20),
     'truck': (220,  60,  60),
+    'goal_car': (0, 255, 200),  # fallback if route color missing
 }
 LIGHT_COLORS = {
     0: (0,   220,   0),   # NS green
@@ -51,7 +84,7 @@ LIGHT_COLORS = {
 # ---------------------------------------------------------------------------
 # Load the saved chromosome
 # ---------------------------------------------------------------------------
-PKL = os.path.join(os.path.dirname(__file__), 'best_timing_array.pkl')
+PKL = os.path.abspath(resolve_pkl_path(_pkl_from_argv()))
 with open(PKL, 'rb') as f:
     best_blocks = pickle.load(f)
 
@@ -68,6 +101,39 @@ schedule = np.array(flat[:3600], dtype=int)
 
 def to_px(metres):
     return int(metres * SCALE)
+
+
+def goal_route_color(vehicle_id: int) -> tuple:
+    """Stable saturated RGB per vehicle id so car, path, and destination match."""
+    h = (vehicle_id * 0.618033988749895) % 1.0
+    r, g, b = colorsys.hsv_to_rgb(h, 0.90, 0.98)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+def vehicle_sim_xy_m(v) -> tuple:
+    """Simulation (x, y) in metres — same frame as path_xy."""
+    if v.axis == "h":
+        return (float(v.abs_pos), float(INTERSECTIONS_H[v.channel_idx]))
+    return (float(INTERSECTIONS_V[v.channel_idx]), float(v.abs_pos))
+
+
+def remaining_route_polyline(v, path_xy: list) -> list:
+    """From the car's current position along the planned route to the goal."""
+    if len(path_xy) < 2:
+        return list(path_xy)
+    cx, cy = vehicle_sim_xy_m(v)
+    best_i = 0
+    best_d = 1e18
+    for i, (px, py) in enumerate(path_xy):
+        d = (px - cx) ** 2 + (py - cy) ** 2
+        if d < best_d:
+            best_d = d
+            best_i = i
+    tail = path_xy[best_i:]
+    # If we're essentially at tail[0], skip duplicate vertex
+    if tail and (tail[0][0] - cx) ** 2 + (tail[0][1] - cy) ** 2 < 64.0:
+        tail = tail[1:]
+    return [(cx, cy)] + [tuple(p) for p in tail]
 
 
 def draw_road_network(surf):
@@ -144,12 +210,46 @@ def draw_lights(surf, light):
             pygame.draw.circle(surf, ew_c, (cx - ROAD_HALF_W - 8, cy), 7)
 
 
+def draw_goal_routes_and_destinations(surf, vehicles):
+    """
+    For each goal car: draw remaining route + destination marker.
+
+    Lines are drawn on an alpha overlay only — they never interact with simulation
+    physics (collision uses road_arrays in ArrayBasedTraining, not pixels).
+    """
+    overlay = pygame.Surface((SIM_W, SIM_H), pygame.SRCALPHA)
+    for v in vehicles:
+        if v.finished or not isinstance(v, GoalVehicle):
+            continue
+        col = goal_route_color(v.id)
+        line_pts = remaining_route_polyline(v, v.path_xy)
+        if len(line_pts) >= 2:
+            px_pts = [(to_px(x), to_px(y)) for x, y in line_pts]
+            pygame.draw.lines(overlay, (20, 20, 20, 100), False, px_pts, 6)
+            pygame.draw.lines(overlay, (*col, 200), False, px_pts, 3)
+    surf.blit(overlay, (0, 0))
+
+    for v in vehicles:
+        if v.finished or not isinstance(v, GoalVehicle):
+            continue
+        col = goal_route_color(v.id)
+        gx, gy = v.goal_xy
+        gpx, gpy = to_px(gx), to_px(gy)
+        s = 7
+        pts_d = [(gpx, gpy - s), (gpx + s, gpy), (gpx, gpy + s), (gpx - s, gpy)]
+        pygame.draw.polygon(surf, col, pts_d)
+        pygame.draw.polygon(surf, (255, 255, 255), pts_d, 2)
+
+
 def draw_vehicles(surf, vehicles):
     """Draw every active vehicle as a small rectangle on its lane."""
     for v in vehicles:
         if v.finished:
             continue
-        col = VEHICLE_COLORS.get(v.vtype, (150, 150, 150))
+        if isinstance(v, GoalVehicle):
+            col = goal_route_color(v.id)
+        else:
+            col = VEHICLE_COLORS.get(v.vtype, (150, 150, 150))
 
         front_px = to_px(v.abs_pos)
         rear_px  = to_px(v.abs_pos - v.direction * v.length)
@@ -160,12 +260,14 @@ def draw_vehicles(surf, vehicles):
             cy     = to_px(INTERSECTIONS_H[v.channel_idx])
             lane_y = cy - LANE_OFFSET - 5 if v.direction == 1 else cy + LANE_OFFSET
             pygame.draw.rect(surf, col, (lo_px, lane_y, v_len, 8))
+            pygame.draw.rect(surf, (0, 0, 0), (lo_px, lane_y, v_len, 8), 1)
             pygame.draw.line(surf, (255, 255, 255),
                              (front_px, lane_y), (front_px, lane_y + 7), 2)
         else:
             cx     = to_px(INTERSECTIONS_V[v.channel_idx])
             lane_x = cx - LANE_OFFSET - 5 if v.direction == 1 else cx + LANE_OFFSET
             pygame.draw.rect(surf, col, (lane_x, lo_px, 8, v_len))
+            pygame.draw.rect(surf, (0, 0, 0), (lane_x, lo_px, 8, v_len), 1)
             pygame.draw.line(surf, (255, 255, 255),
                              (lane_x, front_px), (lane_x + 7, front_px), 2)
 
@@ -184,24 +286,39 @@ def draw_hud(surf, font, small_font, t, light, vehicles, active, paused, speed_m
     lines = [
         (f"Time: {mins:02d}:{secs:02d}  (t={t}/3600)",          (255, 255, 255)),
         (f"Light: {state_names.get(light, '?')}",                LIGHT_COLORS.get(light, (200,200,200))),
-        (f"Spawned: {len(vehicles)}  Active: {len(active)}  "
-         f"Finished: {finished}  Idling: {idling}",              (200, 200, 200)),
-        (f"Speed: {speed_mult}x   [SPACE] pause  [+/-] speed  [Q] quit",
-                                                                  (150, 150, 150)),
     ]
+    if light == 4:
+        lines.append(
+            ("All approaches must stop (yellow→red clearance) — not blocked by route lines.",
+             (255, 190, 160)),
+        )
+    lines.extend(
+        [
+            (f"Spawned: {len(vehicles)}  Active: {len(active)}  "
+             f"Finished: {finished}  Idling: {idling}", (200, 200, 200)),
+            (f"Speed: {speed_mult}x   [SPACE] pause  [+/-] speed  [Q] quit",
+             (150, 150, 150)),
+            ("Routes: visual only (no effect on traffic).", (130, 200, 130)),
+        ]
+    )
     if paused:
         lines.insert(0, ("--- PAUSED ---", (255, 200, 0)))
 
     for i, (txt, col) in enumerate(lines):
-        f = font if i < 3 else small_font
-        surf.blit(f.render(txt, True, col), (14, SIM_H + 8 + i * 22))
+        f = font if txt.startswith("Time:") or txt.startswith("Light:") else small_font
+        surf.blit(f.render(txt, True, col), (14, SIM_H + 8 + i * 20))
 
-    # Colour legend
-    for i, (vt, col) in enumerate(VEHICLE_COLORS.items()):
-        lx = WIN_W - 160
-        ly = SIM_H + 10 + i * 22
+    # Colour legend (goal cars use unique colors — shown as swatch + note)
+    legend = [("car", VEHICLE_COLORS["car"]), ("bus", VEHICLE_COLORS["bus"]),
+              ("truck", VEHICLE_COLORS["truck"]), ("goal_car*", (180, 180, 180))]
+    for i, (vt, col) in enumerate(legend):
+        lx = WIN_W - 200
+        ly = SIM_H + 10 + i * 20
         pygame.draw.rect(surf, col, (lx, ly + 2, 16, 10))
+        pygame.draw.rect(surf, (80, 80, 80), (lx, ly + 2, 16, 10), 1)
         surf.blit(small_font.render(vt, True, (200, 200, 200)), (lx + 22, ly))
+    surf.blit(small_font.render("*unique color + diamond = dest", True, (160, 160, 160)),
+              (WIN_W - 200, SIM_H + 10 + len(legend) * 20))
 
 # ---------------------------------------------------------------------------
 # Main simulation loop
@@ -246,6 +363,7 @@ def main():
 
         if paused:
             draw_road_network(screen)
+            draw_goal_routes_and_destinations(screen, vehicles)
             draw_vehicles(screen, vehicles)
             draw_lights(screen, int(schedule[min(t, 3599)]))
             draw_hud(screen, font, small_font, t, int(schedule[min(t, 3599)]),
@@ -259,33 +377,12 @@ def main():
             if t >= 3600:
                 break
 
-            # Spawning
-            from ArrayBasedTraining import pos_to_seg
-            for _ in range(SPAWNS_PER_SECOND):
-                if random.random() < SPAWN_RATE:
-                    axis      = random.choice(['h', 'v'])
-                    direction = random.choice([1, -1])
-                    ch_idx    = random.randint(0, GRID_SIZE - 1)
-                    vtype     = random.choice(['car', 'bus', 'truck'])
-                    v_len     = VTYPES[vtype]['length']
-
-                    spawn_abs = 0.0 if direction == 1 else float(MAP_END)
-                    si, li    = pos_to_seg(spawn_abs)
-                    key       = (axis, ch_idx, si, direction)
-                    arr       = road_arrays.get(key)
-                    can_spawn = False
-                    if arr is not None:
-                        check = arr[:v_len + SPEED_LIMIT + 2] if direction == 1 \
-                                else arr[-(v_len + SPEED_LIMIT + 2):]
-                        can_spawn = not np.any(check != 0)
-
-                    if can_spawn:
-                        nv = Vehicle(vtype, axis, direction, ch_idx)
-                        nv.stamp(road_arrays)
-                        vehicles.append(nv)
-                        active_vehicles.append(nv)
+            for _ in range(REPLAY_SPAWNS_PER_TICK):
+                if random.random() < SPAWN_RATE * REPLAY_SPAWN_RATE_MULT:
+                    try_spawn_one_vehicle(road_arrays, vehicles, active_vehicles)
 
             light = int(schedule[t])
+            _sort_vehicles_for_step(active_vehicles)
             next_active = []
             for v in active_vehicles:
                 dist = min(_dist_ahead_in_arrays(v, road_arrays),
@@ -298,6 +395,7 @@ def main():
 
         # --- Draw ---
         draw_road_network(screen)
+        draw_goal_routes_and_destinations(screen, vehicles)
         draw_vehicles(screen, vehicles)
         draw_lights(screen, int(schedule[min(t - 1, 3599)]))
         draw_hud(screen, font, small_font, t, int(schedule[min(t - 1, 3599)]),
