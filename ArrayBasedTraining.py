@@ -597,14 +597,14 @@ def try_spawn_one_vehicle(
 
 
 # ---------------------------------------------------------------------------
-# TimingBlock (same genotype as original)
+# Genotype — per-intersection timing
 # ---------------------------------------------------------------------------
 
+N_INTERSECTIONS = GRID_SIZE * GRID_SIZE
+
+
 class TimingBlock:
-    """
-    Encapsulates one traffic-light phase block.
-    Enforces mandatory yellow (6s) + all-red (3s) safety transitions.
-    """
+    """Legacy single-phase block (kept so old pickles can still be unpickled)."""
 
     def __init__(self, g_ns: int, g_ew: int):
         self.g_ns = g_ns
@@ -615,6 +615,53 @@ class TimingBlock:
             + ([2] * g_ew)
             + [3, 3, 3, 3, 3, 3, 4, 4, 4]
         )
+
+
+class IntersectionTiming:
+    """
+    One intersection's repeating signal cycle.
+
+    g_ns    – green seconds for NS (light state 0)
+    g_ew    – green seconds for EW (light state 2)
+    offset  – phase offset in seconds (enables green waves)
+
+    The cycle always includes mandatory yellow (6 s) + all-red (3 s) clearance
+    after each green, identical to the old TimingBlock.  The offset shifts the
+    entire pattern so neighbouring intersections can be staggered.
+    """
+
+    def __init__(self, g_ns: int, g_ew: int, offset: int = 0):
+        self.g_ns = g_ns
+        self.g_ew = g_ew
+        self.offset = offset
+        self.cycle = (
+            ([0] * g_ns)
+            + [1, 1, 1, 1, 1, 1, 4, 4, 4]
+            + ([2] * g_ew)
+            + [3, 3, 3, 3, 3, 3, 4, 4, 4]
+        )
+        self.cycle_len = len(self.cycle)
+
+
+def build_schedules(genes: List['IntersectionTiming']) -> dict:
+    """
+    Build per-intersection 3600-s schedules from a chromosome.
+
+    Returns {intersection_id: np.ndarray[int] of length 3600}.
+    Intersection id = h_road_idx * GRID_SIZE + v_road_idx.
+    """
+    t_arr = np.arange(3600)
+    schedules = {}
+    for ix_id, timing in enumerate(genes):
+        cycle = np.array(timing.cycle, dtype=int)
+        indices = (t_arr + timing.offset) % timing.cycle_len
+        schedules[ix_id] = cycle[indices]
+    return schedules
+
+
+def build_baseline_genes() -> List['IntersectionTiming']:
+    """All intersections at 30 s / 30 s with no offset (uniform baseline)."""
+    return [IntersectionTiming(30, 30, 0) for _ in range(N_INTERSECTIONS)]
 
 # ---------------------------------------------------------------------------
 # Simulation engine
@@ -724,38 +771,50 @@ def _dist_ahead_in_arrays(vehicle: Vehicle, road_arrays: dict) -> float:
     return float('inf')
 
 
-def _dist_to_stop_line(vehicle: Vehicle, light: int) -> float:
+def _dist_to_stop_line(vehicle: Vehicle, schedules: dict, t: int) -> float:
     """
-    Return the distance to the nearest upcoming red stop line.
-    Returns float('inf') if the next light is green/yellow for this vehicle.
+    Return the distance to the nearest upcoming red/all-red stop line.
+
+    Each intersection now has its own schedule, so the vehicle may face a green
+    at one intersection but a red at the next.  We scan all intersections ahead
+    and return the gap to the closest one that is red for this vehicle's axis.
+
+    Returns float('inf') when every intersection ahead is green/yellow.
     """
     STOP_OFFSET = 12  # metres before intersection centre
 
-    is_green = (
-        (light == 0 or light == 1) if vehicle.axis == 'v'
-        else (light == 2 or light == 3)
-    )
-    if is_green:
-        return float('inf')
-
-    valid_stops = []
-    # h-vehicles travel along x and are stopped by vertical roads (INTERSECTIONS_V)
-    # v-vehicles travel along y and are stopped by horizontal roads (INTERSECTIONS_H)
     stop_coords = INTERSECTIONS_V if vehicle.axis == 'h' else INTERSECTIONS_H
-    for ix in stop_coords:
-        stop_line = ix - STOP_OFFSET if vehicle.direction == 1 else ix + STOP_OFFSET
-        if (vehicle.direction == 1 and vehicle.abs_pos < stop_line) or \
-           (vehicle.direction == -1 and vehicle.abs_pos > stop_line):
-            valid_stops.append(stop_line)
+    best_dist = float('inf')
 
-    if not valid_stops:
-        return float('inf')
+    for j, ix_pos in enumerate(stop_coords):
+        stop_line = ix_pos - STOP_OFFSET if vehicle.direction == 1 else ix_pos + STOP_OFFSET
 
-    if vehicle.direction == 1:
-        nxt = min(valid_stops)
-        return max(0.0, float(nxt - vehicle.abs_pos))
-    nxt = max(valid_stops)
-    return max(0.0, float(vehicle.abs_pos - nxt))
+        if vehicle.direction == 1:
+            if vehicle.abs_pos >= stop_line:
+                continue
+        else:
+            if vehicle.abs_pos <= stop_line:
+                continue
+
+        # Identify intersection id:  row = h-road idx, col = v-road idx
+        if vehicle.axis == 'h':
+            ix_id = vehicle.channel_idx * GRID_SIZE + j
+        else:
+            ix_id = j * GRID_SIZE + vehicle.channel_idx
+
+        light = int(schedules[ix_id][t])
+        is_green = (
+            (light == 0 or light == 1) if vehicle.axis == 'v'
+            else (light == 2 or light == 3)
+        )
+        if is_green:
+            continue
+
+        dist = abs(stop_line - vehicle.abs_pos)
+        if dist < best_dist:
+            best_dist = dist
+
+    return best_dist
 
 
 def evaluate(genes, seed, gen_idx=0, verbose=False):
@@ -786,13 +845,7 @@ def evaluate(genes, seed, gen_idx=0, verbose=False):
     vehicles: list[Vehicle] = []
     active_vehicles: list[Vehicle] = []
 
-    # Flatten timing blocks into a 3600-second schedule
-    flat = []
-    for b in genes:
-        flat.extend(b.seq)
-    if len(flat) < 3600:
-        flat.extend([4] * (3600 - len(flat)))
-    schedule = np.array(flat[:3600], dtype=int)
+    schedules = build_schedules(genes)
 
     for t in range(3600):
         # --- Spawning: attempt SPAWNS_PER_SECOND times per tick ---
@@ -800,14 +853,12 @@ def evaluate(genes, seed, gen_idx=0, verbose=False):
             if random.random() < SPAWN_RATE:
                 try_spawn_one_vehicle(road_arrays, vehicles, active_vehicles)
 
-        light = int(schedule[t])
-
         # --- Physics step ---
         _sort_vehicles_for_step(active_vehicles)
         next_active = []
         for v in active_vehicles:
             dist_arr   = _dist_ahead_in_arrays(v, road_arrays)
-            dist_light = _dist_to_stop_line(v, light)
+            dist_light = _dist_to_stop_line(v, schedules, t)
             dist       = min(dist_arr, dist_light)
 
             v.step(road_arrays, dist)
@@ -822,8 +873,7 @@ def evaluate(genes, seed, gen_idx=0, verbose=False):
             finished_so_far = sum(1 for v in vehicles if v.finished)
             idling_now      = sum(1 for v in active_vehicles if v.speed == 0)
             print(f"  t={t+1:4d}s | spawned={len(vehicles):4d} | active={len(active_vehicles):4d} "
-                  f"| finished={finished_so_far:4d} | idling={idling_now:3d} "
-                  f"| light={light}")
+                  f"| finished={finished_so_far:4d} | idling={idling_now:3d}")
 
     # --- Fitness ---
     # All vehicles (finished or not) contribute their accumulated travel and
@@ -862,10 +912,21 @@ def tournament_selection(population, fitness_scores, k=3):
 
 
 def crossover(p1, p2):
+    """Single-point crossover over the list of per-intersection timings."""
     if random.random() < CROSSOVER_RATE:
         split = random.randint(1, len(p1) - 1)
-        return p1[:split] + p2[split:]
+        return [copy.deepcopy(t) for t in p1[:split]] + [copy.deepcopy(t) for t in p2[split:]]
     return copy.deepcopy(p1)
+
+
+def mutate(individual):
+    """Replace one random intersection's timing with fresh random parameters."""
+    idx = random.randint(0, len(individual) - 1)
+    individual[idx] = IntersectionTiming(
+        g_ns=random.randint(10, 80),
+        g_ew=random.randint(10, 80),
+        offset=random.randint(0, 60),
+    )
 
 
 def project_dir() -> str:
@@ -945,10 +1006,14 @@ if __name__ == '__main__':
     print(f"Run output directory: {run_dir}")
 
     pop = [
-        [TimingBlock(random.randint(15, 50), random.randint(15, 50)) for _ in range(40)]
+        [IntersectionTiming(
+            g_ns=random.randint(15, 50),
+            g_ew=random.randint(15, 50),
+            offset=random.randint(0, 60),
+        ) for _ in range(N_INTERSECTIONS)]
         for _ in range(n_pop)
     ]
-    baseline_genes = [TimingBlock(30, 30) for _ in range(60)]
+    baseline_genes = build_baseline_genes()
 
     print(f"Starting EA | POP_SIZE={n_pop} | GENS={n_gens} "
           f"| MUTATION_RATE={MUTATION_RATE} | CROSSOVER_RATE={CROSSOVER_RATE}")
@@ -1011,15 +1076,13 @@ if __name__ == '__main__':
             print(f"  Generation wall time: {gen_elapsed:.1f}s")
 
             # Elitism + reproduction
-            new_pop = [pop[best_idx]]
+            new_pop = [copy.deepcopy(pop[best_idx])]
             while len(new_pop) < n_pop:
                 p1    = tournament_selection(pop, scores, k=TOURNAMENT_K)
                 p2    = tournament_selection(pop, scores, k=TOURNAMENT_K)
                 child = crossover(p1, p2)
                 if random.random() < MUTATION_RATE:
-                    child[random.randint(0, len(child) - 1)] = TimingBlock(
-                        random.randint(10, 80), random.randint(10, 80)
-                    )
+                    mutate(child)
                 new_pop.append(child)
 
             pop = new_pop

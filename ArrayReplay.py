@@ -35,15 +35,18 @@ from ArrayBasedTraining import (
     Vehicle,
     GoalVehicle,
     TimingBlock,
+    IntersectionTiming,
     VTYPES,
     INTERSECTIONS_H,
     INTERSECTIONS_V,
     MAP_END,
     GRID_SIZE,
+    N_INTERSECTIONS,
     SPAWN_RATE,
     SPAWNS_PER_SECOND,
     SPEED_LIMIT,
     build_road_arrays,
+    build_schedules,
     _dist_ahead_in_arrays,
     _dist_to_stop_line,
     _sort_vehicles_for_step,
@@ -88,12 +91,7 @@ PKL = os.path.abspath(resolve_pkl_path(_pkl_from_argv()))
 with open(PKL, 'rb') as f:
     best_blocks = pickle.load(f)
 
-flat = []
-for b in best_blocks:
-    flat.extend(b.seq)
-if len(flat) < 3600:
-    flat.extend([4] * (3600 - len(flat)))
-schedule = np.array(flat[:3600], dtype=int)
+schedules = build_schedules(best_blocks)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -196,16 +194,20 @@ def draw_road_network(surf):
         surf.blit(lbl, (mid_px - lbl.get_width() // 2, cy0 - ROAD_HALF_W - 14))
 
 
-def draw_lights(surf, light):
-    """Draw a coloured dot at every intersection for the current light state."""
-    for rx_idx in range(GRID_SIZE):
-        for ry_idx in range(GRID_SIZE):
-            cx = to_px(INTERSECTIONS_V[rx_idx])
-            cy = to_px(INTERSECTIONS_H[ry_idx])
+def draw_lights(surf, schedules, t):
+    """Draw a coloured dot at every intersection for its current light state."""
+    t_clamped = min(t, 3599)
+    for col in range(GRID_SIZE):
+        for row in range(GRID_SIZE):
+            ix_id = row * GRID_SIZE + col
+            light = int(schedules[ix_id][t_clamped])
+            cx = to_px(INTERSECTIONS_V[col])
+            cy = to_px(INTERSECTIONS_H[row])
             ns_c = (0, 220, 0) if light in (0, 1) else (200, 0, 0)
             ew_c = (0, 220, 0) if light in (2, 3) else (200, 0, 0)
             if light == 1: ns_c = (255, 220, 0)
             if light == 3: ew_c = (255, 220, 0)
+            if light == 4: ns_c = ew_c = (200, 0, 0)
             pygame.draw.circle(surf, ns_c, (cx, cy - ROAD_HALF_W - 8), 7)
             pygame.draw.circle(surf, ew_c, (cx - ROAD_HALF_W - 8, cy), 7)
 
@@ -272,43 +274,36 @@ def draw_vehicles(surf, vehicles):
                              (lane_x, front_px), (lane_x + 7, front_px), 2)
 
 
-def draw_hud(surf, font, small_font, t, light, vehicles, active, paused, speed_mult):
+def draw_hud(surf, font, small_font, t, schedules, vehicles, active, paused, speed_mult):
     """Draw the bottom HUD panel."""
     pygame.draw.rect(surf, (30, 30, 30), (0, SIM_H, WIN_W, WIN_H - SIM_H))
 
     finished = sum(1 for v in vehicles if v.finished)
     idling   = sum(1 for v in active   if v.speed == 0)
 
-    state_names = {0: 'NS Green / EW Red', 1: 'NS Yellow / EW Red',
-                   2: 'NS Red / EW Green', 3: 'NS Red / EW Yellow', 4: 'All Red'}
+    t_c = min(t, 3599)
+    ns_green = sum(1 for ix in range(N_INTERSECTIONS) if int(schedules[ix][t_c]) in (0, 1))
+    ew_green = sum(1 for ix in range(N_INTERSECTIONS) if int(schedules[ix][t_c]) in (2, 3))
+    all_red  = N_INTERSECTIONS - ns_green - ew_green
 
     mins, secs = divmod(t, 60)
     lines = [
         (f"Time: {mins:02d}:{secs:02d}  (t={t}/3600)",          (255, 255, 255)),
-        (f"Light: {state_names.get(light, '?')}",                LIGHT_COLORS.get(light, (200,200,200))),
+        (f"Lights: {ns_green} NS-grn  {ew_green} EW-grn  {all_red} all-red  (per-intersection)",
+         (180, 220, 180)),
+        (f"Spawned: {len(vehicles)}  Active: {len(active)}  "
+         f"Finished: {finished}  Idling: {idling}", (200, 200, 200)),
+        (f"Speed: {speed_mult}x   [SPACE] pause  [+/-] speed  [Q] quit",
+         (150, 150, 150)),
+        ("Routes: visual only (no effect on traffic).", (130, 200, 130)),
     ]
-    if light == 4:
-        lines.append(
-            ("All approaches must stop (yellow→red clearance) — not blocked by route lines.",
-             (255, 190, 160)),
-        )
-    lines.extend(
-        [
-            (f"Spawned: {len(vehicles)}  Active: {len(active)}  "
-             f"Finished: {finished}  Idling: {idling}", (200, 200, 200)),
-            (f"Speed: {speed_mult}x   [SPACE] pause  [+/-] speed  [Q] quit",
-             (150, 150, 150)),
-            ("Routes: visual only (no effect on traffic).", (130, 200, 130)),
-        ]
-    )
     if paused:
         lines.insert(0, ("--- PAUSED ---", (255, 200, 0)))
 
     for i, (txt, col) in enumerate(lines):
-        f = font if txt.startswith("Time:") or txt.startswith("Light:") else small_font
+        f = font if txt.startswith("Time:") else small_font
         surf.blit(f.render(txt, True, col), (14, SIM_H + 8 + i * 20))
 
-    # Colour legend (goal cars use unique colors — shown as swatch + note)
     legend = [("car", VEHICLE_COLORS["car"]), ("bus", VEHICLE_COLORS["bus"]),
               ("truck", VEHICLE_COLORS["truck"]), ("goal_car*", (180, 180, 180))]
     for i, (vt, col) in enumerate(legend):
@@ -365,8 +360,8 @@ def main():
             draw_road_network(screen)
             draw_goal_routes_and_destinations(screen, vehicles)
             draw_vehicles(screen, vehicles)
-            draw_lights(screen, int(schedule[min(t, 3599)]))
-            draw_hud(screen, font, small_font, t, int(schedule[min(t, 3599)]),
+            draw_lights(screen, schedules, t)
+            draw_hud(screen, font, small_font, t, schedules,
                      vehicles, active_vehicles, paused, speed_mult)
             pygame.display.flip()
             clock.tick(30)
@@ -381,12 +376,11 @@ def main():
                 if random.random() < SPAWN_RATE * REPLAY_SPAWN_RATE_MULT:
                     try_spawn_one_vehicle(road_arrays, vehicles, active_vehicles)
 
-            light = int(schedule[t])
             _sort_vehicles_for_step(active_vehicles)
             next_active = []
             for v in active_vehicles:
                 dist = min(_dist_ahead_in_arrays(v, road_arrays),
-                           _dist_to_stop_line(v, light))
+                           _dist_to_stop_line(v, schedules, t))
                 v.step(road_arrays, dist)
                 if not v.finished:
                     next_active.append(v)
@@ -397,8 +391,8 @@ def main():
         draw_road_network(screen)
         draw_goal_routes_and_destinations(screen, vehicles)
         draw_vehicles(screen, vehicles)
-        draw_lights(screen, int(schedule[min(t - 1, 3599)]))
-        draw_hud(screen, font, small_font, t, int(schedule[min(t - 1, 3599)]),
+        draw_lights(screen, schedules, max(t - 1, 0))
+        draw_hud(screen, font, small_font, t, schedules,
                  vehicles, active_vehicles, paused, speed_mult)
         pygame.display.flip()
         clock.tick(60)

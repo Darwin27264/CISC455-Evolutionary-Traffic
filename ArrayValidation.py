@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from ArrayBasedTraining import (
     Vehicle,
     TimingBlock,
+    IntersectionTiming,
     VTYPES,
     INTERSECTIONS_H,
     INTERSECTIONS_V,
@@ -40,10 +41,13 @@ from ArrayBasedTraining import (
     SEGMENT_LENGTHS_V,
     MAP_END,
     GRID_SIZE,
+    N_INTERSECTIONS,
     SPAWN_RATE,
     SPAWNS_PER_SECOND,
     SPEED_LIMIT,
     build_road_arrays,
+    build_schedules,
+    build_baseline_genes,
     _dist_ahead_in_arrays,
     _dist_to_stop_line,
     _sort_vehicles_for_step,
@@ -60,45 +64,39 @@ OUTPUT_DIR = os.path.dirname(PKL_PATH)
 with open(PKL_PATH, 'rb') as f:
     best_blocks = pickle.load(f)
 
-print(f"Loaded {len(best_blocks)} TimingBlocks from {PKL_PATH}")
+print(f"Loaded {len(best_blocks)} entries from {PKL_PATH}")
 print(f"Saving plots to: {OUTPUT_DIR}")
 
 # ---------------------------------------------------------------------------
-# Flatten chromosome into a 3600-second schedule
+# Build per-intersection schedules
 # ---------------------------------------------------------------------------
-flat = []
-for b in best_blocks:
-    flat.extend(b.seq)
-if len(flat) < 3600:
-    flat.extend([4] * (3600 - len(flat)))
-schedule = np.array(flat[:3600], dtype=int)
+ev_schedules = build_schedules(best_blocks)
+bl_schedules = build_schedules(build_baseline_genes())
 
 # ---------------------------------------------------------------------------
-# Also build a baseline schedule for comparison
+# Plot 1 — Phase-sequence heatmap (all intersections, first 20 minutes)
 # ---------------------------------------------------------------------------
-baseline_flat = []
-for _ in range(60):
-    baseline_flat.extend(TimingBlock(30, 30).seq)
-if len(baseline_flat) < 3600:
-    baseline_flat.extend([4] * (3600 - len(baseline_flat)))
-baseline_schedule = np.array(baseline_flat[:3600], dtype=int)
+fig, axes = plt.subplots(GRID_SIZE, GRID_SIZE, figsize=(16, 10), sharex=True, sharey=True)
+from matplotlib.colors import ListedColormap
+phase_cmap = ListedColormap(['#2ca02c', '#ffdc00', '#1f77b4', '#ff851b', '#d62728'])
+phase_labels = ['NS Grn', 'NS Yel', 'EW Grn', 'EW Yel', 'AllRed']
 
-# ---------------------------------------------------------------------------
-# Plot 1 — Evolved phase sequence (first 20 minutes)
-# ---------------------------------------------------------------------------
-fig, ax = plt.subplots(figsize=(14, 4))
-ax.plot(schedule[:1200], color='#1f77b4', drawstyle='steps-post', linewidth=1.5,
-        label='Evolved')
-ax.plot(baseline_schedule[:1200], color='#d62728', drawstyle='steps-post',
-        linewidth=1.0, alpha=0.5, linestyle='--', label='Baseline (30s/30s)')
-ax.set_title("Evolved vs Baseline Phase Sequence (First 20 Minutes)", fontsize=14)
-ax.set_xlabel("Simulation Time (seconds)", fontsize=12)
-ax.set_ylabel("Light State", fontsize=12)
-ax.set_yticks([0, 1, 2, 3, 4])
-ax.set_yticklabels(['0: NS Green', '1: NS Yellow', '2: EW Green',
-                    '3: EW Yellow', '4: All Red'])
-ax.grid(True, axis='x', alpha=0.3)
-ax.legend()
+for row in range(GRID_SIZE):
+    for col in range(GRID_SIZE):
+        ix_id = row * GRID_SIZE + col
+        ax = axes[row][col]
+        ev_s = ev_schedules[ix_id][:1200]
+        bl_s = bl_schedules[ix_id][:1200]
+        ax.imshow(np.vstack([ev_s, bl_s]), aspect='auto', cmap=phase_cmap,
+                  vmin=0, vmax=4, interpolation='nearest',
+                  extent=[0, 1200, 2, 0])
+        ax.set_yticks([0.5, 1.5])
+        ax.set_yticklabels(['Evo', 'Base'], fontsize=8)
+        t = best_blocks[ix_id]
+        ax.set_title(f"({row},{col}) g={t.g_ns}/{t.g_ew} off={t.offset}", fontsize=9)
+
+fig.suptitle("Per-Intersection Phase Sequences (first 20 min)", fontsize=14)
+fig.supxlabel("Simulation Time (seconds)")
 plt.tight_layout()
 plt.savefig(os.path.join(OUTPUT_DIR, 'plot_phase_sequence.png'), dpi=150)
 plt.show()
@@ -107,7 +105,7 @@ print("Saved: plot_phase_sequence.png")
 # ---------------------------------------------------------------------------
 # Full simulation replay — collect per-vehicle stats + density history
 # ---------------------------------------------------------------------------
-def replay(sched, seed=3000, label=""):
+def replay(schedules, seed=3000, label=""):
     random.seed(seed)
     Vehicle._next_id = 1
     road_arrays = build_road_arrays()
@@ -116,19 +114,16 @@ def replay(sched, seed=3000, label=""):
     active_vehicles = []
     density_history = []
 
-    flat_sched = np.array(sched, dtype=int)
-
     for t in range(3600):
         for _ in range(SPAWNS_PER_SECOND):
             if random.random() < SPAWN_RATE:
                 try_spawn_one_vehicle(road_arrays, vehicles, active_vehicles)
 
-        light = int(flat_sched[t])
         _sort_vehicles_for_step(active_vehicles)
         next_active = []
         for v in active_vehicles:
             dist = min(_dist_ahead_in_arrays(v, road_arrays),
-                       _dist_to_stop_line(v, light))
+                       _dist_to_stop_line(v, schedules, t))
             v.step(road_arrays, dist)
             if not v.finished:
                 next_active.append(v)
@@ -163,10 +158,10 @@ def replay(sched, seed=3000, label=""):
 
 
 print("\nReplaying EVOLVED strategy...")
-ev_vehicles, ev_finished, ev_density, ev_score = replay(schedule,        seed=3000, label="EVOLVED STRATEGY")
+ev_vehicles, ev_finished, ev_density, ev_score = replay(ev_schedules,  seed=3000, label="EVOLVED STRATEGY")
 
-print("\nReplaying BASELINE strategy (30s NS / 30s EW)...")
-bl_vehicles, bl_finished, bl_density, bl_score = replay(baseline_schedule, seed=3000, label="BASELINE STRATEGY")
+print("\nReplaying BASELINE strategy (30s NS / 30s EW, no offsets)...")
+bl_vehicles, bl_finished, bl_density, bl_score = replay(bl_schedules, seed=3000, label="BASELINE STRATEGY")
 
 # ---------------------------------------------------------------------------
 # Plot 2 — Per-vehicle-type avg travel time (evolved vs baseline)
