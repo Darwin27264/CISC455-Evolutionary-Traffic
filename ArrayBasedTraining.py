@@ -61,9 +61,9 @@ GOAL_VEHICLE_FRACTION_MAX = 0.50
 # EA parameters
 POP_SIZE      = 25
 GENS          = 15
-MUTATION_RATE = 0.5 # default 0.3
+MUTATION_RATE = 0.3 # default 0.3
 CROSSOVER_RATE= 0.8
-TOURNAMENT_K  = 3
+TOURNAMENT_K  = 5 # default 3
 
 # Intersection positions along each axis — H and V are intentionally different
 # so the grid is asymmetric (more realistic, harder for the EA to exploit symmetry).
