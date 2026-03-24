@@ -43,7 +43,7 @@ Default population size, generation count, and rates are defined at the top of `
 Install dependencies (Pygame is only required for the visual replay):
 
 ```bash
-pip install numpy matplotlib pygame
+pip install -r requirements.txt
 ```
 
 Train a new run (writes `runs/<timestamp>/best_timing_array.pkl`, updates `runs/latest_run.txt`, and logs to that folder):
