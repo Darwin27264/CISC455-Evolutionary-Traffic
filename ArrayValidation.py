@@ -8,6 +8,8 @@ Loads best_timing_array.pkl produced by ArrayBasedTraining.py and produces:
   4. An active-vehicle density plot over the full hour with trendline
   5. Scatter plots: mean adjacent road-segment length vs g_ns, g_ew, and phase offset
      (Pearson r); exploratory — small grids yield noisy correlations.
+    6. Directional signal synchronization analysis (global phase alignment +
+         travel-time-shifted green-wave progression) vs baseline.
 
 Display: phase sequence opens in its own window; other plots are grouped into one
 scalable dashboard window. Each plot is still saved as a separate PNG file.
@@ -159,8 +161,123 @@ def draw_correlation_scatters(axes3, seg_mean, y_ns, y_ew, y_off, r_ns, r_ew, r_
     axes3[2].grid(alpha=0.3)
 
 
+def draw_signal_sync_comparison(ax, labels, ev_vals, bl_vals, width=0.36):
+    idx = np.arange(len(labels))
+    ax.bar(idx - width / 2, ev_vals, width, label='Evolved', color='#1f77b4')
+    ax.bar(idx + width / 2, bl_vals, width, label='Baseline', color='#d62728', alpha=0.7)
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("Score (0..1)")
+    ax.set_title("Signal synchronization comparison")
+    ax.set_xticks(idx)
+    ax.set_xticklabels(labels, rotation=12, ha='right')
+    ax.grid(axis='y', alpha=0.3)
+    ax.legend()
+
+    for i, (ev, bl) in enumerate(zip(ev_vals, bl_vals)):
+        ax.text(i - width / 2, min(1.02, ev + 0.02), f"{ev:.3f}", ha='center', va='bottom', fontsize=8)
+        ax.text(i + width / 2, min(1.02, bl + 0.02), f"{bl:.3f}", ha='center', va='bottom', fontsize=8)
+
+
 def _savefig_only(path, dpi=150):
     plt.savefig(path, dpi=dpi, bbox_inches='tight')
+
+
+def _direction_state_ns(phases: np.ndarray) -> np.ndarray:
+    """Map global phase encoding to NS-local state: 0=green, 1=yellow, 2=red."""
+    st = np.full(phases.shape, 2, dtype=int)
+    st[phases == 0] = 0
+    st[phases == 1] = 1
+    return st
+
+
+def _direction_state_ew(phases: np.ndarray) -> np.ndarray:
+    """Map global phase encoding to EW-local state: 0=green, 1=yellow, 2=red."""
+    st = np.full(phases.shape, 2, dtype=int)
+    st[phases == 2] = 0
+    st[phases == 3] = 1
+    return st
+
+
+def _pairwise_state_sync(state_matrix: np.ndarray) -> float:
+    """
+    Mean pairwise agreement ratio across intersections for one direction.
+    1.0 means intersections are always in the same directional state.
+    """
+    n = int(state_matrix.shape[0])
+    if n < 2:
+        return float('nan')
+    pair_scores = []
+    for i in range(n):
+        si = state_matrix[i]
+        for j in range(i + 1, n):
+            pair_scores.append(float(np.mean(si == state_matrix[j])))
+    return float(np.mean(pair_scores)) if pair_scores else float('nan')
+
+
+def _arrival_green_score(upstream_green: np.ndarray, downstream_green: np.ndarray, tau: int) -> float:
+    """
+    Fraction of upstream-green departures that reach downstream on green,
+    using travel-time shift tau (seconds).
+    """
+    if tau < 0 or tau >= upstream_green.size:
+        return float('nan')
+    if tau == 0:
+        up = upstream_green
+        dn = downstream_green
+    else:
+        up = upstream_green[:-tau]
+        dn = downstream_green[tau:]
+    movers = up.astype(bool)
+    if not np.any(movers):
+        return float('nan')
+    return float(np.mean(dn[movers]))
+
+
+def _progression_sync_by_direction(green_matrix: np.ndarray, axis: str) -> float:
+    """
+    Green-wave progression score for adjacent intersections.
+
+    axis='ew': pairs along each row (left/right neighbors), tau from SEGMENT_LENGTHS_V.
+    axis='ns': pairs along each column (top/bottom neighbors), tau from SEGMENT_LENGTHS_H.
+    """
+    scores = []
+    if axis == 'ew':
+        for row in range(GRID_SIZE):
+            for col in range(GRID_SIZE - 1):
+                a = row * GRID_SIZE + col
+                b = row * GRID_SIZE + (col + 1)
+                tau = max(1, int(round(SEGMENT_LENGTHS_V[col + 1] / SPEED_LIMIT)))
+                scores.append(_arrival_green_score(green_matrix[a], green_matrix[b], tau))
+                scores.append(_arrival_green_score(green_matrix[b], green_matrix[a], tau))
+    elif axis == 'ns':
+        for row in range(GRID_SIZE - 1):
+            for col in range(GRID_SIZE):
+                a = row * GRID_SIZE + col
+                b = (row + 1) * GRID_SIZE + col
+                tau = max(1, int(round(SEGMENT_LENGTHS_H[row + 1] / SPEED_LIMIT)))
+                scores.append(_arrival_green_score(green_matrix[a], green_matrix[b], tau))
+                scores.append(_arrival_green_score(green_matrix[b], green_matrix[a], tau))
+    else:
+        return float('nan')
+
+    scores = [s for s in scores if not np.isnan(s)]
+    return float(np.mean(scores)) if scores else float('nan')
+
+
+def compute_signal_sync_metrics(schedules: dict) -> dict:
+    """Compute directional synchronization metrics for one strategy schedule set."""
+    phases = np.array([schedules[ix] for ix in range(N_INTERSECTIONS)], dtype=int)
+    ns_state = _direction_state_ns(phases)
+    ew_state = _direction_state_ew(phases)
+    ns_green = (phases == 0)
+    ew_green = (phases == 2)
+
+    return {
+        'ns_global_sync': _pairwise_state_sync(ns_state),
+        'ew_global_sync': _pairwise_state_sync(ew_state),
+        'ns_progression_sync': _progression_sync_by_direction(ns_green, axis='ns'),
+        'ew_progression_sync': _progression_sync_by_direction(ew_green, axis='ew'),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +442,50 @@ print(f"\nFinal fitness - Evolved: {ev_score:.2f}  |  Baseline: {bl_score:.2f}  
       f"|  Improvement: {bl_score - ev_score:+.2f}")
 
 # ---------------------------------------------------------------------------
+# Directional signal synchronization analysis
+# ---------------------------------------------------------------------------
+ev_sync = compute_signal_sync_metrics(ev_schedules)
+bl_sync = compute_signal_sync_metrics(bl_schedules)
+
+print("\nDirectional signal synchronization (0..1; higher = more synchronized):")
+print("  Global phase alignment (same directional state across intersections)")
+print(f"    NS  evolved={ev_sync['ns_global_sync']:.3f}  baseline={bl_sync['ns_global_sync']:.3f}  "
+    f"delta={ev_sync['ns_global_sync'] - bl_sync['ns_global_sync']:+.3f}")
+print(f"    EW  evolved={ev_sync['ew_global_sync']:.3f}  baseline={bl_sync['ew_global_sync']:.3f}  "
+    f"delta={ev_sync['ew_global_sync'] - bl_sync['ew_global_sync']:+.3f}")
+print("  Green-wave progression alignment (arrival-on-green for adjacent intersections)")
+print(f"    NS  evolved={ev_sync['ns_progression_sync']:.3f}  baseline={bl_sync['ns_progression_sync']:.3f}  "
+    f"delta={ev_sync['ns_progression_sync'] - bl_sync['ns_progression_sync']:+.3f}")
+print(f"    EW  evolved={ev_sync['ew_progression_sync']:.3f}  baseline={bl_sync['ew_progression_sync']:.3f}  "
+    f"delta={ev_sync['ew_progression_sync'] - bl_sync['ew_progression_sync']:+.3f}")
+
+sync_labels = [
+    'NS global',
+    'EW global',
+    'NS progression',
+    'EW progression',
+]
+sync_ev_vals = [
+    ev_sync['ns_global_sync'],
+    ev_sync['ew_global_sync'],
+    ev_sync['ns_progression_sync'],
+    ev_sync['ew_progression_sync'],
+]
+sync_bl_vals = [
+    bl_sync['ns_global_sync'],
+    bl_sync['ew_global_sync'],
+    bl_sync['ns_progression_sync'],
+    bl_sync['ew_progression_sync'],
+]
+
+_fig, _ax = plt.subplots(figsize=(10, 5), layout='constrained')
+draw_signal_sync_comparison(_ax, sync_labels, sync_ev_vals, sync_bl_vals)
+_fig.suptitle("Directional signal synchronization: evolved vs baseline", fontsize=13)
+_savefig_only(os.path.join(OUTPUT_DIR, 'plot_signal_sync.png'))
+plt.close(_fig)
+print("Saved: plot_signal_sync.png")
+
+# ---------------------------------------------------------------------------
 # Road-length vs timings (data + save plot 5)
 # ---------------------------------------------------------------------------
 def _mean_adjacent_segment_m(row: int, col: int) -> float:
@@ -378,13 +539,13 @@ print("Saved: plot_road_timing_correlation.png")
 # ---------------------------------------------------------------------------
 # Single dashboard window: travel/idling | finish | density | correlation
 # ---------------------------------------------------------------------------
-_dash = plt.figure(figsize=(14, 18), layout='constrained')
+_dash = plt.figure(figsize=(14, 20), layout='constrained')
 try:
     _dash.canvas.manager.set_window_title("Traffic validation — metrics dashboard")
 except Exception:
     pass
 
-_gs = _dash.add_gridspec(4, 1, height_ratios=[1.05, 0.62, 1.15, 1.0])
+_gs = _dash.add_gridspec(5, 1, height_ratios=[1.05, 0.62, 0.72, 1.15, 1.0])
 _gs0 = _gs[0].subgridspec(1, 2, wspace=0.06)
 _ax_tt = _dash.add_subplot(_gs0[0, 0])
 _ax_idl = _dash.add_subplot(_gs0[0, 1])
@@ -393,10 +554,13 @@ draw_vehicle_breakdown(_ax_tt, _ax_idl, vtypes, x, width, ev_tt, bl_tt, ev_idl, 
 _ax_fr = _dash.add_subplot(_gs[1])
 draw_finish_rate(_ax_fr, vtypes, x, width, ev_fr, bl_fr)
 
-_ax_den = _dash.add_subplot(_gs[2])
+_ax_sync = _dash.add_subplot(_gs[2])
+draw_signal_sync_comparison(_ax_sync, sync_labels, sync_ev_vals, sync_bl_vals)
+
+_ax_den = _dash.add_subplot(_gs[3])
 draw_density(_ax_den, t_axis, ev_density, bl_density)
 
-_gs3 = _gs[3].subgridspec(1, 3, wspace=0.1)
+_gs3 = _gs[4].subgridspec(1, 3, wspace=0.1)
 _ax_c0 = _dash.add_subplot(_gs3[0, 0])
 _ax_c1 = _dash.add_subplot(_gs3[0, 1])
 _ax_c2 = _dash.add_subplot(_gs3[0, 2])
