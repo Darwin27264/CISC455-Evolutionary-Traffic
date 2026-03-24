@@ -56,12 +56,12 @@ MAX_ACTIVE_VEHICLES_FOR_SPAWN: Optional[int] = None
 # Goal-directed vehicles: fraction of spawn attempts routed to interior spawn + A* route.
 # Each attempt samples uniformly in [MIN, MAX] for extra training variability (set equal for fixed rate).
 GOAL_VEHICLE_FRACTION_MIN = 0.40
-GOAL_VEHICLE_FRACTION_MAX = 0.60
+GOAL_VEHICLE_FRACTION_MAX = 0.50
 
 # EA parameters
 POP_SIZE      = 25
 GENS          = 15
-MUTATION_RATE = 0.3
+MUTATION_RATE = 0.5 # default 0.3
 CROSSOVER_RATE= 0.8
 TOURNAMENT_K  = 3
 
