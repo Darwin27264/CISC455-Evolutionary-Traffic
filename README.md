@@ -1,6 +1,6 @@
-# Evolutionary optimization of traffic signal timing
+# **CISC 455** - Evolutionary optimization of traffic signal timing
 
-**CISC 455.** This repository trains an evolutionary algorithm (EA) to set per-intersection traffic light parameters on a continuous **N×N** road grid with bidirectional traffic, car-following physics, and goal-directed vehicles routed with **A\***.
+ This repository trains an evolutionary algorithm (EA) to set per-intersection traffic light parameters on a continuous **N×N** road grid with bidirectional traffic, car-following physics, and goal-directed vehicles routed with **A\***.
 
 ![Simulation demo](demo.gif)
 
